@@ -1,4 +1,4 @@
-package com.example.kafkacsqlsmt;
+package org.funathome.kafkacsqlsmt;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;

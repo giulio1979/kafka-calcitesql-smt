@@ -71,20 +71,21 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
             java.util.Set<String> tableRefs = new java.util.HashSet<>();
             if (statement != null) {
                 String lowerSql = statement.toLowerCase();
-                String[] keywords = {"from", "join"};
+                String[] keywords = { "from", "join" };
                 for (String keyword : keywords) {
                     int idx = 0;
                     while ((idx = lowerSql.indexOf(keyword, idx)) != -1) {
                         int start = idx + keyword.length();
                         // Skip whitespace
-                        while (start < lowerSql.length() && Character.isWhitespace(lowerSql.charAt(start))) start++;
+                        while (start < lowerSql.length() && Character.isWhitespace(lowerSql.charAt(start)))
+                            start++;
                         // Read until next whitespace, comma, parenthesis, or end
                         int end = start;
                         while (end < lowerSql.length() &&
-                            !Character.isWhitespace(lowerSql.charAt(end)) &&
-                            lowerSql.charAt(end) != ',' &&
-                            lowerSql.charAt(end) != '(' &&
-                            lowerSql.charAt(end) != ')') {
+                                !Character.isWhitespace(lowerSql.charAt(end)) &&
+                                lowerSql.charAt(end) != ',' &&
+                                lowerSql.charAt(end) != '(' &&
+                                lowerSql.charAt(end) != ')') {
                             end++;
                         }
                         String ref = statement.substring(start, end).replaceAll("[\"']", "");
@@ -100,7 +101,8 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
             for (String ref : tableRefs) {
                 String fieldName = ref.substring("inputrecord.".length());
                 Object subValue = jsonMap.get(fieldName);
-                if (subValue == null) continue;
+                if (subValue == null)
+                    continue;
                 if (subValue instanceof java.util.List) {
                     rootSchema.add(ref, new SimpleCalciteArrayTable((java.util.List<?>) subValue));
                     log.info("CSqlTransform: Registered subtable '{}' as array (from List)", ref);
@@ -112,21 +114,30 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
                             if (!parsedList.isEmpty() && parsedList.get(0) instanceof Map) {
                                 rootSchema.add(ref, new SimpleCalciteArrayTable(parsedList));
                                 jsonMap.put(fieldName, parsedList);
-                                log.info("CSqlTransform: Registered subtable '{}' as array of objects (from string) and updated main record", ref);
+                                log.info(
+                                        "CSqlTransform: Registered subtable '{}' as array of objects (from string) and updated main record",
+                                        ref);
                             } else {
-                                log.warn("CSqlTransform: Parsed string field '{}' as array, but not array of objects, skipping registration", fieldName);
+                                log.warn(
+                                        "CSqlTransform: Parsed string field '{}' as array, but not array of objects, skipping registration",
+                                        fieldName);
                             }
                         } else if (parsed instanceof Map) {
                             java.util.List<Map<String, Object>> singleRowList = new java.util.ArrayList<>();
                             singleRowList.add((Map<String, Object>) parsed);
                             rootSchema.add(ref, new SimpleCalciteArrayTable(singleRowList));
                             jsonMap.put(fieldName, parsed);
-                            log.info("CSqlTransform: Registered subtable '{}' as single-row object (from string/inner table) and updated main record", ref);
+                            log.info(
+                                    "CSqlTransform: Registered subtable '{}' as single-row object (from string/inner table) and updated main record",
+                                    ref);
                         } else {
-                            log.warn("CSqlTransform: Parsed string field '{}' but result is not array or object, skipping registration", fieldName);
+                            log.warn(
+                                    "CSqlTransform: Parsed string field '{}' but result is not array or object, skipping registration",
+                                    fieldName);
                         }
                     } catch (Exception ex) {
-                        log.warn("CSqlTransform: Could not parse string field '{}' as JSON array/object: {}", fieldName, ex.getMessage());
+                        log.warn("CSqlTransform: Could not parse string field '{}' as JSON array/object: {}", fieldName,
+                                ex.getMessage());
                     }
                 } else if (subValue instanceof Map) {
                     java.util.List<Map<String, Object>> singleRowList = new java.util.ArrayList<>();

@@ -1,9 +1,10 @@
 name: Build and Release Maven Package
 
+
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'v*'
 
 jobs:
   build-release:

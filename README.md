@@ -34,6 +34,61 @@ A Kafka record with schema containing fields `a` and `b`.
 
 
 ## Test Scenarios & Examples
+### 7. Join with nested array subtable
+**Input:**
+```
+{
+	"invoicenumber": 2,
+	"lineitems": [
+		{ "product": "tomatoes", "price": "3" }
+	]
+}
+```
+**SQL:**
+```
+select a.*, b.*
+	from inputrecord a
+	join "inputrecord.lineitems" b on true
+```
+**Expected Output:**
+Kafka record with fields 'invoicenumber', 'product', 'price'.
+
+### 8. Join with stringified JSON array subtable
+**Input:**
+```
+{
+	"invoicenumber": 2,
+	"lineitems": "[ {\"product\": \"tomatoes\", \"price\": \"3\" } ]"
+}
+```
+**SQL:**
+```
+select a.*, b.*
+	from inputrecord a
+	join "inputrecord.lineitems" b on true
+```
+**Expected Output:**
+Kafka record with fields 'invoicenumber', 'product', 'price'.
+
+### 9. Join with custom array construction
+**Input:**
+```
+{
+	"invoicenumber": 2,
+	"lineitems": [ { "product": "tomatoes", "price": "3" } ]
+}
+```
+**SQL:**
+```
+select
+	a.invoicenumber,
+	b.product,
+	ARRAY[ROW(b.price, 'usd')] as prices
+from inputrecord a
+	join "inputrecord.lineitems" b on true
+```
+**Expected Output:**
+Kafka record with fields 'invoicenumber', 'product', and 'prices' (array of price and currency).
 
 ### 1. Schemaless input with nested JSON field
 **Input:** `{"a": 1, "b":2, "c": "{\"json\": 5}", "arr": [1,2,3]}`

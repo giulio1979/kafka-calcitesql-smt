@@ -29,23 +29,6 @@ jobs:
       - name: Build with Maven
         run: mvn clean package --batch-mode
 
-      - name: Increment version and tag
-        id: version
-        run: |
-          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-          NEW_VERSION=$(echo $VERSION | awk -F. '{OFS="."; $NF+=1; print $0}')
-          mvn versions:set -DnewVersion=$NEW_VERSION
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git commit -am "Release $NEW_VERSION"
-          git tag v$NEW_VERSION
-          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Push changes and tags
-        uses: ad-m/github-push-action@v0.8.0
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          tags: true
 
       - name: Upload JAR to GitHub Release
         uses: softprops/action-gh-release@v1

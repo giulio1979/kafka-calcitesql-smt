@@ -305,4 +305,5 @@ public class CSqlTransformTest {
         assertNull(struct.get("a"));
         assertEquals(2, struct.get("b"));
     }
+
 }

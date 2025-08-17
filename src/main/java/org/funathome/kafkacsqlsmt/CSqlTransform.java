@@ -1,4 +1,3 @@
-
 package org.funathome.kafkacsqlsmt;
 
 import org.slf4j.Logger;
@@ -18,6 +17,10 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.tools.RelBuilder;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory;
+import org.apache.calcite.sql.fun.SqlLibrary;
+import org.apache.calcite.sql.util.ChainedSqlOperatorTable;
 import java.sql.DriverManager;
 import java.sql.Connection;
 import java.util.Map;
@@ -27,13 +30,15 @@ import org.apache.kafka.common.config.ConfigDef;
 public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation<R> {
     private static final Logger log = LoggerFactory.getLogger(CSqlTransform.class);
     public static final String STATEMENT_CONFIG = "kafka.connect.transform.csql.statement";
+    public static final String AVRO_SCHEMA_CONFIG = "kafka.connect.transform.csql.avro.schema";
     private String statement;
+    private String avroSchemaString;
     private ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
     public void configure(Map<String, ?> configs) {
-
         this.statement = (String) configs.get(STATEMENT_CONFIG);
+        this.avroSchemaString = (String) configs.get(AVRO_SCHEMA_CONFIG);
     }
 
     @Override
@@ -64,8 +69,20 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
             CalciteConnection calciteConnection = connection.unwrap(CalciteConnection.class);
             SchemaPlus rootSchema = calciteConnection.getRootSchema();
 
-            // Always register the main table
-            rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
+            // Register the main table with Avro schema if provided
+            if (avroSchemaString != null && !avroSchemaString.isEmpty()) {
+                try {
+                    org.apache.avro.Schema avroSchema = new org.apache.avro.Schema.Parser().parse(avroSchemaString);
+                    rootSchema.add("inputrecord", new AvroSchemaTable(jsonMap, avroSchema));
+                    log.info("CSqlTransform: Using Avro schema for inputrecord table");
+                } catch (Exception e) {
+                    log.warn("Failed to parse Avro schema: " + e.getMessage() + ", falling back to auto-inferred schema");
+                    rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
+                }
+            } else {
+                // No Avro schema provided, use auto-inferred schema
+                rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
+            }
 
             // Parse SQL for table references after FROM and JOIN
             java.util.Set<String> tableRefs = new java.util.HashSet<>();
@@ -159,6 +176,8 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
                 java.sql.ResultSet rs = stmt.executeQuery(statement);
                 java.sql.ResultSetMetaData meta = rs.getMetaData();
                 int columnCount = meta.getColumnCount();
+
+                // Build output schema from SQL query results metadata
                 for (int i = 1; i <= columnCount; i++) {
                     String colName = meta.getColumnLabel(i);
                     // For join queries, strip alias prefix if present (dot or underscore)
@@ -177,6 +196,7 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
                     int colType = meta.getColumnType(i);
                     builder.field(baseName, sqlTypeToConnectSchema(colType));
                 }
+
                 Schema outputSchema = builder.build();
                 outputStruct = new Struct(outputSchema);
                 if (rs.next()) {
@@ -307,6 +327,147 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
         }
     }
 
+    // Avro schema-aware table for Calcite
+    static class AvroSchemaTable extends org.apache.calcite.schema.impl.AbstractTable
+            implements org.apache.calcite.schema.ScannableTable {
+        private final Map<String, Object> row;
+        private final org.apache.avro.Schema avroSchema;
+
+        public AvroSchemaTable(Map<String, Object> row, org.apache.avro.Schema avroSchema) {
+            this.row = row;
+            this.avroSchema = avroSchema;
+        }
+
+        @Override
+        public org.apache.calcite.linq4j.Enumerable<Object[]> scan(org.apache.calcite.DataContext dataContext) {
+            // Use Avro schema field order for consistent column ordering
+            java.util.List<org.apache.avro.Schema.Field> fields = avroSchema.getFields();
+            Object[] values = new Object[fields.size()];
+
+            for (int i = 0; i < fields.size(); i++) {
+                org.apache.avro.Schema.Field field = fields.get(i);
+                String fieldName = field.name();
+                Object rawValue = row.get(fieldName);
+
+                // Convert value based on Avro schema type
+                values[i] = convertValueForAvroType(rawValue, field.schema());
+            }
+
+            java.util.List<Object[]> rows = java.util.Collections.singletonList(values);
+            return org.apache.calcite.linq4j.Linq4j.asEnumerable(rows);
+        }
+
+        @Override
+        public org.apache.calcite.rel.type.RelDataType getRowType(
+                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
+            final org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder =
+                new org.apache.calcite.rel.type.RelDataTypeFactory.Builder(typeFactory);
+
+            // Build schema from Avro field definitions
+            for (org.apache.avro.Schema.Field field : avroSchema.getFields()) {
+                String fieldName = field.name();
+                org.apache.calcite.rel.type.RelDataType calciteType =
+                    avroTypeToCalciteType(field.schema(), typeFactory);
+                builder.add(fieldName, calciteType);
+            }
+
+            return builder.build();
+        }
+
+        private Object convertValueForAvroType(Object value, org.apache.avro.Schema fieldSchema) {
+            if (value == null) {
+                return null;
+            }
+
+            // Handle union types (commonly used for nullable fields)
+            if (fieldSchema.getType() == org.apache.avro.Schema.Type.UNION) {
+                for (org.apache.avro.Schema unionType : fieldSchema.getTypes()) {
+                    if (unionType.getType() != org.apache.avro.Schema.Type.NULL) {
+                        return convertValueForAvroType(value, unionType);
+                    }
+                }
+            }
+
+            switch (fieldSchema.getType()) {
+                case STRING:
+                    return value.toString();
+                case INT:
+                    if (value instanceof Number) {
+                        return ((Number) value).intValue();
+                    }
+                    return Integer.parseInt(value.toString());
+                case LONG:
+                    if (value instanceof Number) {
+                        return ((Number) value).longValue();
+                    }
+                    return Long.parseLong(value.toString());
+                case FLOAT:
+                    if (value instanceof Number) {
+                        return ((Number) value).floatValue();
+                    }
+                    return Float.parseFloat(value.toString());
+                case DOUBLE:
+                    if (value instanceof Number) {
+                        return ((Number) value).doubleValue();
+                    }
+                    return Double.parseDouble(value.toString());
+                case BOOLEAN:
+                    if (value instanceof Boolean) {
+                        return value;
+                    }
+                    return Boolean.parseBoolean(value.toString());
+                default:
+                    return value;
+            }
+        }
+
+        private org.apache.calcite.rel.type.RelDataType avroTypeToCalciteType(
+                org.apache.avro.Schema avroType,
+                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
+
+            boolean nullable = false;
+            org.apache.avro.Schema actualType = avroType;
+
+            // Handle union types (commonly used for nullable fields)
+            if (avroType.getType() == org.apache.avro.Schema.Type.UNION) {
+                for (org.apache.avro.Schema unionType : avroType.getTypes()) {
+                    if (unionType.getType() == org.apache.avro.Schema.Type.NULL) {
+                        nullable = true;
+                    } else {
+                        actualType = unionType;
+                    }
+                }
+            }
+
+            org.apache.calcite.rel.type.RelDataType calciteType;
+            switch (actualType.getType()) {
+                case STRING:
+                    calciteType = typeFactory.createJavaType(String.class);
+                    break;
+                case INT:
+                    calciteType = typeFactory.createJavaType(Integer.class);
+                    break;
+                case LONG:
+                    calciteType = typeFactory.createJavaType(Long.class);
+                    break;
+                case FLOAT:
+                    calciteType = typeFactory.createJavaType(Float.class);
+                    break;
+                case DOUBLE:
+                    calciteType = typeFactory.createJavaType(Double.class);
+                    break;
+                case BOOLEAN:
+                    calciteType = typeFactory.createJavaType(Boolean.class);
+                    break;
+                default:
+                    calciteType = typeFactory.createJavaType(Object.class);
+                    break;
+            }
+
+            return typeFactory.createTypeWithNullability(calciteType, nullable);
+        }
+    }
+
     private Map<String, Object> structToMap(Struct struct) {
         Map<String, Object> map = new HashMap<>();
         for (org.apache.kafka.connect.data.Field field : struct.schema().fields()) {
@@ -319,31 +480,27 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
     private Schema sqlTypeToConnectSchema(int sqlType) {
         switch (sqlType) {
             case java.sql.Types.INTEGER:
-                return Schema.INT32_SCHEMA;
+                return Schema.OPTIONAL_INT32_SCHEMA;
             case java.sql.Types.BIGINT:
-                return Schema.INT64_SCHEMA;
+                return Schema.OPTIONAL_INT64_SCHEMA;
             case java.sql.Types.FLOAT:
             case java.sql.Types.REAL:
-                return Schema.FLOAT32_SCHEMA;
+                return Schema.OPTIONAL_FLOAT32_SCHEMA;
             case java.sql.Types.DOUBLE:
-                return Schema.FLOAT64_SCHEMA;
+                return Schema.OPTIONAL_FLOAT64_SCHEMA;
             case java.sql.Types.BOOLEAN:
-                return Schema.BOOLEAN_SCHEMA;
+                return Schema.OPTIONAL_BOOLEAN_SCHEMA;
             case java.sql.Types.VARCHAR:
             case java.sql.Types.CHAR:
             case java.sql.Types.LONGVARCHAR:
             case java.sql.Types.NVARCHAR:
             case java.sql.Types.NCHAR:
             case java.sql.Types.LONGNVARCHAR:
-                return Schema.STRING_SCHEMA;
+                return Schema.OPTIONAL_STRING_SCHEMA;
             default:
                 return Schema.OPTIONAL_STRING_SCHEMA;
         }
     }
-
-    // Helper to convert SQL type to Kafka Connect Schema
-
-    // Helper to convert SQL type to Kafka Connect Schema
 
     @Override
     public void close() {
@@ -352,6 +509,7 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
     @Override
     public ConfigDef config() {
         return new ConfigDef()
-                .define(STATEMENT_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.HIGH, "SQL statement to execute");
+                .define(STATEMENT_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.HIGH, "SQL statement to execute")
+                .define(AVRO_SCHEMA_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.MEDIUM, "Avro schema for output records");
     }
 }

@@ -7,7 +7,44 @@ This project implements a Kafka Connect Single Message Transform (SMT) in Java, 
 - Executes a SQL SELECT statement (provided via configuration) on each record using Calcite.
 - Produces a new Kafka record with a schema based on the SQL result.
 - Handles missing fields gracefully (sets them to null).
+- **Byte array handling** with configurable byte-skipping for broken JSONSchemaConverter messages.
 - Comprehensive unit tests for various input scenarios.
+
+## Configuration
+
+### Basic Configuration
+```properties
+transforms=csql
+transforms.csql.type=org.funathome.kafkacsqlsmt.CSqlTransform
+transforms.csql.kafka.connect.transform.csql.statement=select a, b from inputrecord
+```
+
+### Configuration Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `kafka.connect.transform.csql.statement` | String | (required) | SQL SELECT statement to execute on each record |
+| `kafka.connect.transform.csql.avro.schema` | String | null | Optional Avro schema for output records |
+| `kafka.connect.transform.csql.skip.bytes.enabled` | Boolean | false | Enable skipping bytes at the beginning of byte array messages |
+| `kafka.connect.transform.csql.skip.bytes` | Integer | 5 | Number of bytes to skip when skip.bytes.enabled=true |
+
+### Handling Broken JSONSchemaConverter Messages
+
+If you have topics using JSONSchemaConverter with a broken schema in the schema registry, you can configure the SMT to skip the schema registry format bytes (1 magic byte + 4 schema ID bytes) and treat the rest as raw JSON:
+
+```properties
+transforms=csql
+transforms.csql.type=org.funathome.kafkacsqlsmt.CSqlTransform
+transforms.csql.kafka.connect.transform.csql.statement=select * from inputrecord
+transforms.csql.kafka.connect.transform.csql.skip.bytes.enabled=true
+transforms.csql.kafka.connect.transform.csql.skip.bytes=5
+```
+
+**How it works:**
+- When `skip.bytes.enabled=true` and the message value is a `byte[]`
+- The first N bytes (default 5) are skipped
+- The remaining bytes are decoded as UTF-8 and parsed as JSON
+- This bypasses the schema registry lookup that would fail with broken schemas
 
 ## Example
 ### Input Record

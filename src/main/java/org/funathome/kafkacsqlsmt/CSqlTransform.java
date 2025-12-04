@@ -31,27 +31,65 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
     private static final Logger log = LoggerFactory.getLogger(CSqlTransform.class);
     public static final String STATEMENT_CONFIG = "kafka.connect.transform.csql.statement";
     public static final String AVRO_SCHEMA_CONFIG = "kafka.connect.transform.csql.avro.schema";
+    public static final String SKIP_BYTES_CONFIG = "kafka.connect.transform.csql.skip.bytes";
+    public static final String SKIP_BYTES_ENABLED_CONFIG = "kafka.connect.transform.csql.skip.bytes.enabled";
     private String statement;
     private String avroSchemaString;
+    private int skipBytes = 5; // Default: 5 bytes for JSONSchemaConverter (1 magic byte + 4 schema ID)
+    private boolean skipBytesEnabled = false;
     private ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
     public void configure(Map<String, ?> configs) {
         this.statement = (String) configs.get(STATEMENT_CONFIG);
         this.avroSchemaString = (String) configs.get(AVRO_SCHEMA_CONFIG);
+        this.skipBytesEnabled = configs.containsKey(SKIP_BYTES_ENABLED_CONFIG) ? 
+            Boolean.parseBoolean(configs.get(SKIP_BYTES_ENABLED_CONFIG).toString()) : false;
+        if (configs.containsKey(SKIP_BYTES_CONFIG)) {
+            this.skipBytes = Integer.parseInt(configs.get(SKIP_BYTES_CONFIG).toString());
+        }
+        log.info("CSqlTransform configured: skipBytesEnabled={}, skipBytes={}", skipBytesEnabled, skipBytes);
     }
 
     @Override
     public R apply(R record) {
         try {
             Object value = record.value();
+            log.debug("CSqlTransform received value type: {}", value != null ? value.getClass().getName() : "null");
             Map<String, Object> jsonMap;
-            if (value instanceof String) {
+            
+            // Handle byte array with skip bytes feature for broken JSONSchemaConverter
+            if (skipBytesEnabled && value instanceof byte[]) {
+                byte[] bytes = (byte[]) value;
+                log.info("Processing byte array with skip bytes enabled. Array length: {}, bytes to skip: {}", bytes.length, skipBytes);
+                if (bytes.length <= skipBytes) {
+                    throw new DataException("Byte array too short to skip " + skipBytes + " bytes. Length: " + bytes.length);
+                }
+                // Skip the first N bytes (schema registry magic byte + schema ID)
+                String jsonString = new String(bytes, skipBytes, bytes.length - skipBytes, java.nio.charset.StandardCharsets.UTF_8);
+                log.debug("Skipped {} bytes from byte array, parsing remaining as JSON: {}", skipBytes, jsonString);
+                jsonMap = objectMapper.readValue(jsonString, Map.class);
+            } else if (skipBytesEnabled && value instanceof String) {
+                // Handle String with skip bytes - convert to bytes first, skip, then parse
+                String stringValue = (String) value;
+                byte[] bytes = stringValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                log.info("Processing string with skip bytes enabled. String length: {}, bytes to skip: {}", bytes.length, skipBytes);
+                if (bytes.length <= skipBytes) {
+                    throw new DataException("String too short to skip " + skipBytes + " bytes. Length: " + bytes.length);
+                }
+                String jsonString = new String(bytes, skipBytes, bytes.length - skipBytes, java.nio.charset.StandardCharsets.UTF_8);
+                log.debug("Skipped {} bytes from string, parsing remaining as JSON: {}", skipBytes, jsonString);
+                jsonMap = objectMapper.readValue(jsonString, Map.class);
+            } else if (value instanceof String) {
                 jsonMap = objectMapper.readValue((String) value, Map.class);
             } else if (value instanceof Map) {
                 jsonMap = (Map<String, Object>) value;
             } else if (value instanceof Struct) {
                 jsonMap = structToMap((Struct) value);
+            } else if (value instanceof byte[]) {
+                // Byte array without skip bytes enabled - treat as UTF-8 JSON string
+                String jsonString = new String((byte[]) value, java.nio.charset.StandardCharsets.UTF_8);
+                jsonMap = objectMapper.readValue(jsonString, Map.class);
             } else {
                 throw new DataException("Unsupported record value type: " + value.getClass());
             }
@@ -510,6 +548,10 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
     public ConfigDef config() {
         return new ConfigDef()
                 .define(STATEMENT_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.HIGH, "SQL statement to execute")
-                .define(AVRO_SCHEMA_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.MEDIUM, "Avro schema for output records");
+                .define(AVRO_SCHEMA_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM, "Avro schema for output records")
+                .define(SKIP_BYTES_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.MEDIUM, 
+                        "Enable skipping bytes at the beginning of byte array messages (useful for broken JSONSchemaConverter with schema registry)")
+                .define(SKIP_BYTES_CONFIG, ConfigDef.Type.INT, 5, ConfigDef.Importance.LOW, 
+                        "Number of bytes to skip when skip.bytes.enabled is true (default: 5 for JSONSchemaConverter magic byte + schema ID)");
     }
 }

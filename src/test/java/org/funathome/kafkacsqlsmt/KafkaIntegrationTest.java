@@ -45,9 +45,7 @@ public class KafkaIntegrationTest {
     private static final String GROUP_ID = "test-consumer-group";
     
     // Transform configuration
-    private static final String SQL_STATEMENT = "SELECT id, SalesOrderNumber, PositionNumber, Country, LastLoadDate,\r\n" + //
-                "      MaterialNumber, OrderQuantity FROM inputrecord where Country in \r\n" + //
-                "      ('DK','NO','SWE')";
+    private static final String SQL_STATEMENT = "SELECT * FROM inputrecord ";
     private static final String DEFAULT_MESSAGE_JSON = null; // e.g., "{\"field1\": \"default\"}"
     private static final boolean SKIP_BYTES_ENABLED = true; // Enable to skip Schema Registry wire format bytes
     private static final int SKIP_BYTES = 5; // Confluent Schema Registry wire format uses 5 bytes

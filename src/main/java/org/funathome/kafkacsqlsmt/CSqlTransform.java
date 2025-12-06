@@ -10,19 +10,13 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.errors.DataException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.calcite.jdbc.CalciteConnection;
 import org.apache.calcite.schema.SchemaPlus;
-import org.apache.calcite.tools.Frameworks;
-import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.parser.SqlParser;
-import org.apache.calcite.tools.RelBuilder;
-import org.apache.calcite.sql.fun.SqlStdOperatorTable;
-import org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory;
-import org.apache.calcite.sql.fun.SqlLibrary;
-import org.apache.calcite.sql.util.ChainedSqlOperatorTable;
 import java.sql.DriverManager;
 import java.sql.Connection;
+import java.io.IOException;
 import java.util.Map;
 import java.util.HashMap;
 import org.apache.kafka.common.config.ConfigDef;
@@ -30,186 +24,123 @@ import org.apache.kafka.common.config.ConfigDef;
 public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation<R> {
     private static final Logger log = LoggerFactory.getLogger(CSqlTransform.class);
     public static final String STATEMENT_CONFIG = "kafka.connect.transform.csql.statement";
-    public static final String AVRO_SCHEMA_CONFIG = "kafka.connect.transform.csql.avro.schema";
     public static final String SKIP_BYTES_CONFIG = "kafka.connect.transform.csql.skip.bytes";
     public static final String SKIP_BYTES_ENABLED_CONFIG = "kafka.connect.transform.csql.skip.bytes.enabled";
+    public static final String DEFAULT_MESSAGE_CONFIG = "kafka.connect.transform.csql.default.message";
+    public static final String FLATTEN_MAPS_CONFIG = "kafka.connect.transform.csql.flatten.maps";
+    private static final TypeReference<Map<String, Object>> MAP_STRING_OBJECT_TYPE = new TypeReference<Map<String, Object>>() {};
     private String statement;
-    private String avroSchemaString;
     private int skipBytes = 5; // Default: 5 bytes for JSONSchemaConverter (1 magic byte + 4 schema ID)
     private boolean skipBytesEnabled = false;
+    private boolean flattenMaps = true; // Default: flatten nested maps
+    private Map<String, Object> defaultMessage = null;
     private ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
     public void configure(Map<String, ?> configs) {
         this.statement = (String) configs.get(STATEMENT_CONFIG);
-        this.avroSchemaString = (String) configs.get(AVRO_SCHEMA_CONFIG);
         this.skipBytesEnabled = configs.containsKey(SKIP_BYTES_ENABLED_CONFIG) ? 
             Boolean.parseBoolean(configs.get(SKIP_BYTES_ENABLED_CONFIG).toString()) : false;
         if (configs.containsKey(SKIP_BYTES_CONFIG)) {
             this.skipBytes = Integer.parseInt(configs.get(SKIP_BYTES_CONFIG).toString());
         }
-        log.info("CSqlTransform configured: skipBytesEnabled={}, skipBytes={}", skipBytesEnabled, skipBytes);
+        
+        // Parse flatten maps option (default: true)
+        this.flattenMaps = configs.containsKey(FLATTEN_MAPS_CONFIG) ?
+            Boolean.parseBoolean(configs.get(FLATTEN_MAPS_CONFIG).toString()) : true;
+        
+        // Parse default message JSON if provided
+        if (configs.containsKey(DEFAULT_MESSAGE_CONFIG)) {
+            String defaultMessageJson = (String) configs.get(DEFAULT_MESSAGE_CONFIG);
+            try {
+                this.defaultMessage = readJsonMap(defaultMessageJson);
+                log.info("Default message configured: {}", defaultMessage);
+            } catch (Exception e) {
+                throw new DataException("Failed to parse default message JSON: " + defaultMessageJson, e);
+            }
+        }
+        
+        log.info("CSqlTransform configured: skipBytesEnabled={}, skipBytes={}, flattenMaps={}, hasDefaultMessage={}", 
+                skipBytesEnabled, skipBytes, flattenMaps, defaultMessage != null);
     }
 
     @Override
     public R apply(R record) {
         try {
             Object value = record.value();
-            log.debug("CSqlTransform received value type: {}", value != null ? value.getClass().getName() : "null");
+            if (value == null) {
+                throw new DataException("Record value is null; cannot apply SQL transformation");
+            }
+            log.debug("CSqlTransform received value type: {}", value.getClass().getName());
             Map<String, Object> jsonMap;
             
             // Handle byte array with skip bytes feature for broken JSONSchemaConverter
             if (skipBytesEnabled && value instanceof byte[]) {
                 byte[] bytes = (byte[]) value;
-                log.info("Processing byte array with skip bytes enabled. Array length: {}, bytes to skip: {}", bytes.length, skipBytes);
+                log.debug("Processing byte array with skip bytes enabled. Array length: {}, bytes to skip: {}", bytes.length, skipBytes);
                 if (bytes.length <= skipBytes) {
                     throw new DataException("Byte array too short to skip " + skipBytes + " bytes. Length: " + bytes.length);
                 }
                 // Skip the first N bytes (schema registry magic byte + schema ID)
                 String jsonString = new String(bytes, skipBytes, bytes.length - skipBytes, java.nio.charset.StandardCharsets.UTF_8);
                 log.debug("Skipped {} bytes from byte array, parsing remaining as JSON: {}", skipBytes, jsonString);
-                jsonMap = objectMapper.readValue(jsonString, Map.class);
-            } else if (skipBytesEnabled && value instanceof String) {
-                // Handle String with skip bytes - convert to bytes first, skip, then parse
-                String stringValue = (String) value;
-                byte[] bytes = stringValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                log.info("Processing string with skip bytes enabled. String length: {}, bytes to skip: {}", bytes.length, skipBytes);
-                if (bytes.length <= skipBytes) {
-                    throw new DataException("String too short to skip " + skipBytes + " bytes. Length: " + bytes.length);
-                }
-                String jsonString = new String(bytes, skipBytes, bytes.length - skipBytes, java.nio.charset.StandardCharsets.UTF_8);
-                log.debug("Skipped {} bytes from string, parsing remaining as JSON: {}", skipBytes, jsonString);
-                jsonMap = objectMapper.readValue(jsonString, Map.class);
-            } else if (value instanceof String) {
-                jsonMap = objectMapper.readValue((String) value, Map.class);
+                jsonMap = readJsonMap(jsonString);
+            }  else if (value instanceof String) {
+                jsonMap = readJsonMap((String) value);
             } else if (value instanceof Map) {
-                jsonMap = (Map<String, Object>) value;
+                jsonMap = sanitizeMap((Map<?, ?>) value);
             } else if (value instanceof Struct) {
                 jsonMap = structToMap((Struct) value);
             } else if (value instanceof byte[]) {
                 // Byte array without skip bytes enabled - treat as UTF-8 JSON string
                 String jsonString = new String((byte[]) value, java.nio.charset.StandardCharsets.UTF_8);
-                jsonMap = objectMapper.readValue(jsonString, Map.class);
+                jsonMap = readJsonMap(jsonString);
             } else {
                 throw new DataException("Unsupported record value type: " + value.getClass());
             }
-
-            log.info("CSqlTransform INPUT RECORD: {}", jsonMap);
-            log.info("CSqlTransform INPUT SCHEMA: {}", record.valueSchema());
-            log.info("CSqlTransform SQL STATEMENT: {}", statement);
-
-            // Register tables based on SQL statement analysis
-            java.util.Properties props = new java.util.Properties();
-            props.setProperty("caseSensitive", "false");
-            props.setProperty("quotedCasing", "UNCHANGED");
-            props.setProperty("unquotedCasing", "UNCHANGED");
-            Connection connection = DriverManager.getConnection("jdbc:calcite:", props);
-            CalciteConnection calciteConnection = connection.unwrap(CalciteConnection.class);
-            SchemaPlus rootSchema = calciteConnection.getRootSchema();
-
-            // Register the main table with Avro schema if provided
-            if (avroSchemaString != null && !avroSchemaString.isEmpty()) {
-                try {
-                    org.apache.avro.Schema avroSchema = new org.apache.avro.Schema.Parser().parse(avroSchemaString);
-                    rootSchema.add("inputrecord", new AvroSchemaTable(jsonMap, avroSchema));
-                    log.info("CSqlTransform: Using Avro schema for inputrecord table");
-                } catch (Exception e) {
-                    log.warn("Failed to parse Avro schema: " + e.getMessage() + ", falling back to auto-inferred schema");
-                    rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
-                }
-            } else {
-                // No Avro schema provided, use auto-inferred schema
-                rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
+            
+            // Deep merge default message if configured
+            if (defaultMessage != null) {
+                log.debug("CSqlTransform DEFAULTS: {}", defaultMessage);
+                log.debug("CSqlTransform DEFAULT MESSAGE field count: {}, fields: {}", defaultMessage.size(), defaultMessage.keySet());
+                log.debug("CSqlTransform INPUT BEFORE MERGE field count: {}, fields: {}", jsonMap.size(), jsonMap.keySet());
+                jsonMap = deepMerge(defaultMessage, jsonMap);
+                log.debug("CSqlTransform MERGED RECORD field count: {}, fields: {}", jsonMap.size(), jsonMap.keySet());
+                
             }
 
-            // Parse SQL for table references after FROM and JOIN
-            java.util.Set<String> tableRefs = new java.util.HashSet<>();
-            if (statement != null) {
-                String lowerSql = statement.toLowerCase();
-                String[] keywords = { "from", "join" };
-                for (String keyword : keywords) {
-                    int idx = 0;
-                    while ((idx = lowerSql.indexOf(keyword, idx)) != -1) {
-                        int start = idx + keyword.length();
-                        // Skip whitespace
-                        while (start < lowerSql.length() && Character.isWhitespace(lowerSql.charAt(start)))
-                            start++;
-                        // Read until next whitespace, comma, parenthesis, or end
-                        int end = start;
-                        while (end < lowerSql.length() &&
-                                !Character.isWhitespace(lowerSql.charAt(end)) &&
-                                lowerSql.charAt(end) != ',' &&
-                                lowerSql.charAt(end) != '(' &&
-                                lowerSql.charAt(end) != ')') {
-                            end++;
-                        }
-                        String ref = statement.substring(start, end).replaceAll("[\"']", "");
-                        if (ref.startsWith("inputrecord.")) {
-                            tableRefs.add(ref);
-                        }
-                        idx = end;
-                    }
-                }
-            }
+            // Flatten nested structures: maps become prefixed keys, arrays become JSON strings
+            jsonMap = flattenMap(jsonMap, "");            
 
-            // Register only referenced subtables
-            for (String ref : tableRefs) {
-                String fieldName = ref.substring("inputrecord.".length());
-                Object subValue = jsonMap.get(fieldName);
-                if (subValue == null)
-                    continue;
-                if (subValue instanceof java.util.List) {
-                    rootSchema.add(ref, new SimpleCalciteArrayTable((java.util.List<?>) subValue));
-                    log.info("CSqlTransform: Registered subtable '{}' as array (from List)", ref);
-                } else if (subValue instanceof String) {
-                    try {
-                        Object parsed = objectMapper.readValue((String) subValue, Object.class);
-                        if (parsed instanceof java.util.List) {
-                            java.util.List<?> parsedList = (java.util.List<?>) parsed;
-                            if (!parsedList.isEmpty() && parsedList.get(0) instanceof Map) {
-                                rootSchema.add(ref, new SimpleCalciteArrayTable(parsedList));
-                                jsonMap.put(fieldName, parsedList);
-                                log.info(
-                                        "CSqlTransform: Registered subtable '{}' as array of objects (from string) and updated main record",
-                                        ref);
-                            } else {
-                                log.warn(
-                                        "CSqlTransform: Parsed string field '{}' as array, but not array of objects, skipping registration",
-                                        fieldName);
-                            }
-                        } else if (parsed instanceof Map) {
-                            java.util.List<Map<String, Object>> singleRowList = new java.util.ArrayList<>();
-                            singleRowList.add((Map<String, Object>) parsed);
-                            rootSchema.add(ref, new SimpleCalciteArrayTable(singleRowList));
-                            jsonMap.put(fieldName, parsed);
-                            log.info(
-                                    "CSqlTransform: Registered subtable '{}' as single-row object (from string/inner table) and updated main record",
-                                    ref);
-                        } else {
-                            log.warn(
-                                    "CSqlTransform: Parsed string field '{}' but result is not array or object, skipping registration",
-                                    fieldName);
-                        }
-                    } catch (Exception ex) {
-                        log.warn("CSqlTransform: Could not parse string field '{}' as JSON array/object: {}", fieldName,
-                                ex.getMessage());
-                    }
-                } else if (subValue instanceof Map) {
-                    java.util.List<Map<String, Object>> singleRowList = new java.util.ArrayList<>();
-                    singleRowList.add((Map<String, Object>) subValue);
-                    rootSchema.add(ref, new SimpleCalciteArrayTable(singleRowList));
-                    log.info("CSqlTransform: Registered subtable '{}' as single-row object (from Map)", ref);
-                }
-            }
+            log.debug("CSqlTransform INPUT RECORD (flattened): {}", jsonMap);
+            log.debug("CSqlTransform INPUT SCHEMA: {}", record.valueSchema());
+            log.debug("CSqlTransform SQL STATEMENT: {}", statement);
 
-            for (String tableName : rootSchema.getTableNames()) {
-                log.info("CSqlTransform REGISTERED TABLE: {} type={}", tableName,
-                        rootSchema.getTable(tableName).getClass().getName());
-            }
-
+            // CRITICAL: Switch to system classloader BEFORE any Calcite operations
+            // Kafka Connect's isolated plugin classloader breaks Janino's ability to find JDK classes
+            // like java.lang.String, causing "findIClass("LString;")" errors in production.
+            // The classloader must be switched BEFORE DriverManager.getConnection() because
+            // Calcite/Janino capture the classloader during connection initialization.
+            ClassLoader originalCL = Thread.currentThread().getContextClassLoader();
             SchemaBuilder builder = SchemaBuilder.struct();
             Struct outputStruct;
+            
             try {
+                Thread.currentThread().setContextClassLoader(ClassLoader.getSystemClassLoader());
+                
+                // Register tables based on SQL statement analysis
+                java.util.Properties props = new java.util.Properties();
+                props.setProperty("caseSensitive", "false");
+                props.setProperty("quotedCasing", "UNCHANGED");
+                props.setProperty("unquotedCasing", "UNCHANGED");
+                
+                Connection connection = DriverManager.getConnection("jdbc:calcite:", props);
+                CalciteConnection calciteConnection = connection.unwrap(CalciteConnection.class);
+                SchemaPlus rootSchema = calciteConnection.getRootSchema();
+
+                rootSchema.add("inputrecord", new SimpleCalciteTable(jsonMap));
+                log.debug("CSqlTransform REGISTERED TABLE: inputrecord");
+                
                 java.sql.Statement stmt = calciteConnection.createStatement();
                 java.sql.ResultSet rs = stmt.executeQuery(statement);
                 java.sql.ResultSetMetaData meta = rs.getMetaData();
@@ -218,21 +149,8 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
                 // Build output schema from SQL query results metadata
                 for (int i = 1; i <= columnCount; i++) {
                     String colName = meta.getColumnLabel(i);
-                    // For join queries, strip alias prefix if present (dot or underscore)
-                    String baseName = colName;
-                    if (baseName.contains(".")) {
-                        String[] parts = baseName.split("\\.");
-                        if (parts.length == 2 && (parts[0].equals("a") || parts[0].equals("b"))) {
-                            baseName = parts[1];
-                        }
-                    } else if (baseName.contains("_")) {
-                        String[] parts = baseName.split("_");
-                        if (parts.length > 1 && (parts[0].equals("a") || parts[0].equals("b"))) {
-                            baseName = String.join("_", java.util.Arrays.copyOfRange(parts, 1, parts.length));
-                        }
-                    }
                     int colType = meta.getColumnType(i);
-                    builder.field(baseName, sqlTypeToConnectSchema(colType));
+                    builder.field(colName, sqlTypeToConnectSchema(colType));
                 }
 
                 Schema outputSchema = builder.build();
@@ -254,6 +172,8 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
             } catch (java.sql.SQLException sqlEx) {
                 log.error("CSqlTransform error: {}", sqlEx.getMessage(), sqlEx);
                 throw new DataException("Failed to apply CSqlTransform", sqlEx);
+            } finally {
+                Thread.currentThread().setContextClassLoader(originalCL);
             }
 
             return record.newRecord(
@@ -270,42 +190,116 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
         }
     }
 
-    // Helper to infer Kafka Connect Schema from Java Object
-    private Schema inferSchema(Object value) {
-        // Helper to convert SQL type to Kafka Connect Schema
-        if (value == null)
-            return Schema.OPTIONAL_STRING_SCHEMA;
-        if (value instanceof Integer)
-            return Schema.INT32_SCHEMA;
-        if (value instanceof Long)
-            return Schema.INT64_SCHEMA;
-        if (value instanceof Float)
-            return Schema.FLOAT32_SCHEMA;
-        if (value instanceof Double)
-            return Schema.FLOAT64_SCHEMA;
-        if (value instanceof Boolean)
-            return Schema.BOOLEAN_SCHEMA;
-        if (value instanceof String)
-            return Schema.STRING_SCHEMA;
-        if (value instanceof Map)
-            return Schema.STRING_SCHEMA; // Serialize nested objects as JSON string
-        if (value instanceof java.util.List)
-            return Schema.STRING_SCHEMA; // Serialize arrays as JSON string
-        return Schema.OPTIONAL_STRING_SCHEMA;
+    private Map<String, Object> readJsonMap(String json) throws IOException {
+        return objectMapper.readValue(json, MAP_STRING_OBJECT_TYPE);
+    }
+
+    private Map<String, Object> sanitizeMap(Map<?, ?> source) {
+        Map<String, Object> sanitized = new HashMap<>();
+        if (source == null) {
+            return sanitized;
+        }
+        for (Map.Entry<?, ?> entry : source.entrySet()) {
+            String key = entry.getKey() == null ? null : entry.getKey().toString();
+            sanitized.put(key, entry.getValue());
+        }
+        return sanitized;
+    }
+
+    /**
+     * Flatten a nested map structure for use with Calcite.
+     * If flattenMaps is true: nested maps become prefixed keys (e.g., address.city -> address_city).
+     * If flattenMaps is false: nested maps are serialized to JSON strings.
+     * Arrays and lists are always serialized to JSON strings.
+     * 
+     * @param input The input map to flatten
+     * @param prefix The current key prefix (empty string for root level)
+     * @return A flattened map with only primitive values
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> flattenMap(Map<String, Object> input, String prefix) {
+        Map<String, Object> result = new HashMap<>();
+        for (Map.Entry<String, Object> entry : input.entrySet()) {
+            String key = prefix.isEmpty() ? entry.getKey() : prefix + "_" + entry.getKey();
+            Object value = entry.getValue();
+            
+            if (value instanceof Map) {
+                if (flattenMaps) {
+                    // Recursively flatten nested maps
+                    result.putAll(flattenMap((Map<String, Object>) value, key));
+                } else {
+                    // Serialize map to JSON string
+                    try {
+                        result.put(key, objectMapper.writeValueAsString(value));
+                    } catch (Exception e) {
+                        result.put(key, String.valueOf(value));
+                    }
+                }
+            } else if (value instanceof java.util.List || (value != null && value.getClass().isArray())) {
+                // Arrays/lists become JSON strings
+                try {
+                    result.put(key, objectMapper.writeValueAsString(value));
+                } catch (Exception e) {
+                    result.put(key, String.valueOf(value));
+                }
+            } else {
+                // Primitives pass through as-is
+                result.put(key, value);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Deep merge two maps, with values from 'source' overriding values in 'target'.
+     * For nested maps, recursively merges them. For other values, source wins.
+     * 
+     * @param target The base map (default values)
+     * @param source The override map (actual input)
+     * @return A new merged map
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> deepMerge(Map<String, Object> target, Map<String, Object> source) {
+        Map<String, Object> result = new HashMap<>(target);
+        
+        for (Map.Entry<String, Object> entry : source.entrySet()) {
+            String key = entry.getKey();
+            Object sourceValue = entry.getValue();
+            
+            if (sourceValue == null) {
+                // Keep the value from source even if it's null (explicit override)
+                result.put(key, null);
+            } else if (result.containsKey(key) && result.get(key) instanceof Map && sourceValue instanceof Map) {
+                // Both are maps, recursively merge
+                result.put(key, deepMerge((Map<String, Object>) result.get(key), (Map<String, Object>) sourceValue));
+            } else {
+                // Source value wins (primitive, array, or different types)
+                result.put(key, sourceValue);
+            }
+        }
+        
+        return result;
     }
 
     // Simple in-memory table for Calcite
     static class SimpleCalciteTable extends org.apache.calcite.schema.impl.AbstractTable
             implements org.apache.calcite.schema.ScannableTable {
         private final Map<String, Object> row;
+        private final java.util.List<String> fieldNames;
 
         public SimpleCalciteTable(Map<String, Object> row) {
             this.row = row;
+            this.fieldNames = new java.util.ArrayList<>(row.keySet());
         }
 
         @Override
         public org.apache.calcite.linq4j.Enumerable<Object[]> scan(org.apache.calcite.DataContext dataContext) {
-            Object[] values = row.values().toArray();
+            // Extract values in the SAME ORDER as the schema defines them (by field name)
+            // This ensures Calcite's generated code accesses the correct array positions
+            Object[] values = new Object[fieldNames.size()];
+            for (int i = 0; i < fieldNames.size(); i++) {
+                values[i] = row.get(fieldNames.get(i));
+            }
             java.util.List<Object[]> rows = java.util.Collections.singletonList(values);
             return org.apache.calcite.linq4j.Linq4j.asEnumerable(rows);
         }
@@ -315,194 +309,39 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
                 org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
             final org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder = new org.apache.calcite.rel.type.RelDataTypeFactory.Builder(
                     typeFactory);
-            for (Map.Entry<String, Object> entry : row.entrySet()) {
-                builder.add(entry.getKey(), typeFactory
-                        .createJavaType(entry.getValue() != null ? entry.getValue().getClass() : Object.class));
+            for (String key : fieldNames) {
+                Object value = row.get(key);
+                builder.add(key, inferType(typeFactory, value));
             }
             return builder.build();
         }
-    }
 
-    // Table for nested arrays (for joins)
-    static class SimpleCalciteArrayTable extends org.apache.calcite.schema.impl.AbstractTable
-            implements org.apache.calcite.schema.ScannableTable {
-        private final java.util.List<?> array;
-
-        public SimpleCalciteArrayTable(java.util.List<?> array) {
-            this.array = array;
-        }
-
-        @Override
-        public org.apache.calcite.linq4j.Enumerable<Object[]> scan(org.apache.calcite.DataContext dataContext) {
-            java.util.List<Object[]> rows = new java.util.ArrayList<>();
-            for (Object item : array) {
-                if (item instanceof Map) {
-                    Map<?, ?> map = (Map<?, ?>) item;
-                    rows.add(map.values().toArray());
-                } else {
-                    rows.add(new Object[] { item });
-                }
-            }
-            return org.apache.calcite.linq4j.Linq4j.asEnumerable(rows);
-        }
-
-        @Override
-        public org.apache.calcite.rel.type.RelDataType getRowType(
-                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
-            final org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder = new org.apache.calcite.rel.type.RelDataTypeFactory.Builder(
-                    typeFactory);
-            if (!array.isEmpty() && array.get(0) instanceof Map) {
-                Map<?, ?> first = (Map<?, ?>) array.get(0);
-                for (Map.Entry<?, ?> entry : first.entrySet()) {
-                    builder.add(entry.getKey().toString(), typeFactory
-                            .createJavaType(entry.getValue() != null ? entry.getValue().getClass() : Object.class));
-                }
+        // Infer SQL type from Java value. Since input is flattened, we only handle primitives.
+        private org.apache.calcite.rel.type.RelDataType inferType(
+                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory,
+                Object value) {
+            org.apache.calcite.sql.type.SqlTypeName typeName;
+            if (value == null || value instanceof String) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.VARCHAR;
+            } else if (value instanceof Integer) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.INTEGER;
+            } else if (value instanceof Long) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.BIGINT;
+            } else if (value instanceof Float) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.REAL;
+            } else if (value instanceof Double) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.DOUBLE;
+            } else if (value instanceof Boolean) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.BOOLEAN;
+            } else if (value instanceof java.math.BigDecimal) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.DECIMAL;
+            } else if (value instanceof java.math.BigInteger) {
+                typeName = org.apache.calcite.sql.type.SqlTypeName.BIGINT;
             } else {
-                builder.add("value",
-                        typeFactory.createJavaType(array.get(0) != null ? array.get(0).getClass() : Object.class));
+                typeName = org.apache.calcite.sql.type.SqlTypeName.VARCHAR;
             }
-            return builder.build();
-        }
-    }
-
-    // Avro schema-aware table for Calcite
-    static class AvroSchemaTable extends org.apache.calcite.schema.impl.AbstractTable
-            implements org.apache.calcite.schema.ScannableTable {
-        private final Map<String, Object> row;
-        private final org.apache.avro.Schema avroSchema;
-
-        public AvroSchemaTable(Map<String, Object> row, org.apache.avro.Schema avroSchema) {
-            this.row = row;
-            this.avroSchema = avroSchema;
-        }
-
-        @Override
-        public org.apache.calcite.linq4j.Enumerable<Object[]> scan(org.apache.calcite.DataContext dataContext) {
-            // Use Avro schema field order for consistent column ordering
-            java.util.List<org.apache.avro.Schema.Field> fields = avroSchema.getFields();
-            Object[] values = new Object[fields.size()];
-
-            for (int i = 0; i < fields.size(); i++) {
-                org.apache.avro.Schema.Field field = fields.get(i);
-                String fieldName = field.name();
-                Object rawValue = row.get(fieldName);
-
-                // Convert value based on Avro schema type
-                values[i] = convertValueForAvroType(rawValue, field.schema());
-            }
-
-            java.util.List<Object[]> rows = java.util.Collections.singletonList(values);
-            return org.apache.calcite.linq4j.Linq4j.asEnumerable(rows);
-        }
-
-        @Override
-        public org.apache.calcite.rel.type.RelDataType getRowType(
-                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
-            final org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder =
-                new org.apache.calcite.rel.type.RelDataTypeFactory.Builder(typeFactory);
-
-            // Build schema from Avro field definitions
-            for (org.apache.avro.Schema.Field field : avroSchema.getFields()) {
-                String fieldName = field.name();
-                org.apache.calcite.rel.type.RelDataType calciteType =
-                    avroTypeToCalciteType(field.schema(), typeFactory);
-                builder.add(fieldName, calciteType);
-            }
-
-            return builder.build();
-        }
-
-        private Object convertValueForAvroType(Object value, org.apache.avro.Schema fieldSchema) {
-            if (value == null) {
-                return null;
-            }
-
-            // Handle union types (commonly used for nullable fields)
-            if (fieldSchema.getType() == org.apache.avro.Schema.Type.UNION) {
-                for (org.apache.avro.Schema unionType : fieldSchema.getTypes()) {
-                    if (unionType.getType() != org.apache.avro.Schema.Type.NULL) {
-                        return convertValueForAvroType(value, unionType);
-                    }
-                }
-            }
-
-            switch (fieldSchema.getType()) {
-                case STRING:
-                    return value.toString();
-                case INT:
-                    if (value instanceof Number) {
-                        return ((Number) value).intValue();
-                    }
-                    return Integer.parseInt(value.toString());
-                case LONG:
-                    if (value instanceof Number) {
-                        return ((Number) value).longValue();
-                    }
-                    return Long.parseLong(value.toString());
-                case FLOAT:
-                    if (value instanceof Number) {
-                        return ((Number) value).floatValue();
-                    }
-                    return Float.parseFloat(value.toString());
-                case DOUBLE:
-                    if (value instanceof Number) {
-                        return ((Number) value).doubleValue();
-                    }
-                    return Double.parseDouble(value.toString());
-                case BOOLEAN:
-                    if (value instanceof Boolean) {
-                        return value;
-                    }
-                    return Boolean.parseBoolean(value.toString());
-                default:
-                    return value;
-            }
-        }
-
-        private org.apache.calcite.rel.type.RelDataType avroTypeToCalciteType(
-                org.apache.avro.Schema avroType,
-                org.apache.calcite.rel.type.RelDataTypeFactory typeFactory) {
-
-            boolean nullable = false;
-            org.apache.avro.Schema actualType = avroType;
-
-            // Handle union types (commonly used for nullable fields)
-            if (avroType.getType() == org.apache.avro.Schema.Type.UNION) {
-                for (org.apache.avro.Schema unionType : avroType.getTypes()) {
-                    if (unionType.getType() == org.apache.avro.Schema.Type.NULL) {
-                        nullable = true;
-                    } else {
-                        actualType = unionType;
-                    }
-                }
-            }
-
-            org.apache.calcite.rel.type.RelDataType calciteType;
-            switch (actualType.getType()) {
-                case STRING:
-                    calciteType = typeFactory.createJavaType(String.class);
-                    break;
-                case INT:
-                    calciteType = typeFactory.createJavaType(Integer.class);
-                    break;
-                case LONG:
-                    calciteType = typeFactory.createJavaType(Long.class);
-                    break;
-                case FLOAT:
-                    calciteType = typeFactory.createJavaType(Float.class);
-                    break;
-                case DOUBLE:
-                    calciteType = typeFactory.createJavaType(Double.class);
-                    break;
-                case BOOLEAN:
-                    calciteType = typeFactory.createJavaType(Boolean.class);
-                    break;
-                default:
-                    calciteType = typeFactory.createJavaType(Object.class);
-                    break;
-            }
-
-            return typeFactory.createTypeWithNullability(calciteType, nullable);
+            return typeFactory.createTypeWithNullability(
+                    typeFactory.createSqlType(typeName), true);
         }
     }
 
@@ -548,10 +387,12 @@ public class CSqlTransform<R extends ConnectRecord<R>> implements Transformation
     public ConfigDef config() {
         return new ConfigDef()
                 .define(STATEMENT_CONFIG, ConfigDef.Type.STRING, ConfigDef.Importance.HIGH, "SQL statement to execute")
-                .define(AVRO_SCHEMA_CONFIG, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM, "Avro schema for output records")
                 .define(SKIP_BYTES_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.MEDIUM, 
                         "Enable skipping bytes at the beginning of byte array messages (useful for broken JSONSchemaConverter with schema registry)")
                 .define(SKIP_BYTES_CONFIG, ConfigDef.Type.INT, 5, ConfigDef.Importance.LOW, 
-                        "Number of bytes to skip when skip.bytes.enabled is true (default: 5 for JSONSchemaConverter magic byte + schema ID)");
+                        "Number of bytes to skip when skip.bytes.enabled is true (default: 5 for JSONSchemaConverter magic byte + schema ID)")
+                .define(FLATTEN_MAPS_CONFIG, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,
+                        "When true, nested maps are flattened with underscore-separated keys (e.g., address_city). When false, nested maps are serialized as JSON strings.");
     }
+
 }
